@@ -1,4 +1,4 @@
-.PHONY: install ensure-state run run-test check reset-state telegram-ids docker-build docker-up docker-up-test docker-down docker-logs docker-reset-state
+.PHONY: install ensure-state clean run run-test check reset-state telegram-ids docker-build docker-up docker-up-test docker-down docker-logs docker-reset-state
 
 install:
 	python3 -m pip install -r requirements.txt
@@ -12,6 +12,14 @@ ensure-state:
 	@if [ ! -f state.json ]; then \
 		printf '{"seen_links":[],"pending":{}}\n' > state.json; \
 	fi
+
+clean:
+	@find . -type d -name "__pycache__" -prune -exec rm -rf {} +
+	@find . -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
+	@rm -rf .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage .coverage.*
+	@if [ -d state.json ]; then rm -rf state.json; fi
+	@printf '{"seen_links":[],"pending":{}}\n' > state.json
+	@echo "Clean complete. state.json reset."
 
 run: ensure-state
 	NEWS_BOT_MODE=prod python3 -m src.bot
