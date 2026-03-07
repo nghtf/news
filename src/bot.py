@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import html
 import logging
 import re
@@ -35,6 +36,8 @@ logger = logging.getLogger(__name__)
 TAG_RE = re.compile(r"<[^>]+>")
 ADMIN_BOT_ID_ERROR = "bots can't send messages to bots"
 MAX_TG_TEXT_LEN = 4096
+MAX_RAW_PREVIEW_SUMMARY_LEN = 260
+REQUIRED_FEED_CATEGORY = "Industry news"
 
 
 def resolve_publish_channel(settings: Settings) -> tuple[str, str]:
@@ -91,14 +94,73 @@ def build_raw_news_body(title: str, summary: str) -> str:
     return "\n\n".join(parts).strip()
 
 
-def build_raw_admin_text(title: str, summary: str, source_url: str) -> str:
+def build_feed_preview_summary(summary: str, max_len: int = MAX_RAW_PREVIEW_SUMMARY_LEN) -> str:
+    value = summary.strip()
+    if len(value) <= max_len:
+        return value
+    cropped = value[:max_len].rsplit(" ", 1)[0].strip()
+    if not cropped:
+        cropped = value[:max_len].strip()
+    return cropped.rstrip(" .,:;!?") + "..."
+
+
+def extract_preview_text_from_feed(entry: Any) -> str:
+    description = str(getattr(entry, "description", "") or entry.get("description", "")).strip()
+    if description:
+        logger.info("Preview source: RSS description")
+        return strip_html(description)
+    logger.info("Preview source fallback: RSS summary")
+    return strip_html(str(getattr(entry, "summary", "") or entry.get("summary", "")).strip())
+
+
+def entry_categories(entry: Any) -> list[str]:
+    values: list[str] = []
+    tags = getattr(entry, "tags", None)
+    if isinstance(tags, list):
+        for tag in tags:
+            if isinstance(tag, dict):
+                term = str(tag.get("term", "") or tag.get("label", "")).strip()
+                if term:
+                    values.append(term)
+    category = str(getattr(entry, "category", "") or entry.get("category", "")).strip()
+    if category:
+        values.append(category)
+    return values
+
+
+def has_required_category(entry: Any, required: str = REQUIRED_FEED_CATEGORY) -> bool:
+    required_norm = required.strip().lower()
+    if not required_norm:
+        return True
+    return any(cat.strip().lower() == required_norm for cat in entry_categories(entry))
+
+
+def build_raw_admin_text(title: str, summary: str, source_url: str, feed_published_at: str = "") -> str:
     body = build_raw_news_body(title=title, summary=summary)
     parts = [body] if body else []
+    if feed_published_at.strip():
+        parts.append(f"Дата новости: {feed_published_at.strip()}")
     parts.append(f"Источник: {source_url}")
     text = "\n\n".join(parts)
     if len(text) <= MAX_TG_TEXT_LEN:
         return text
     return text[: MAX_TG_TEXT_LEN - 3].rstrip() + "..."
+
+
+def format_feed_published_at(entry: Any) -> str:
+    parsed = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+    if parsed:
+        try:
+            # Feedparser parsed dates are UTC.
+            return dt.datetime(*parsed[:6], tzinfo=dt.UTC).strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            pass
+    raw_value = str(
+        getattr(entry, "published", "")
+        or getattr(entry, "updated", "")
+        or getattr(entry, "pubDate", "")
+    ).strip()
+    return raw_value
 
 
 def build_final_admin_text(
@@ -238,7 +300,7 @@ async def process_feeds(app: Application) -> int:
             for entry in reversed(entries):
                 link = getattr(entry, "link", "").strip()
                 title = getattr(entry, "title", "").strip()
-                summary = strip_html(getattr(entry, "summary", "") or getattr(entry, "description", ""))
+                summary = extract_preview_text_from_feed(entry)
                 feed_text_extended = ""
                 entry_content = getattr(entry, "content", None)
                 if isinstance(entry_content, list):
@@ -251,12 +313,26 @@ async def process_feeds(app: Application) -> int:
                     feed_text_extended = " ".join([p for p in parts if p]).strip()
                 if not link or not title:
                     continue
+                if not has_required_category(entry):
+                    logger.info(
+                        "Skipping entry without required category '%s': %s categories=%s",
+                        REQUIRED_FEED_CATEGORY,
+                        link,
+                        entry_categories(entry),
+                    )
+                    continue
                 if store.is_seen(link) or store.has_pending_link(link):
                     continue
 
                 draft_id = uuid.uuid4().hex[:10]
-                preview_text = summary
-                admin_preview_text = build_raw_admin_text(title=title, summary=preview_text, source_url=link)
+                preview_text = build_feed_preview_summary(summary)
+                feed_published_at = format_feed_published_at(entry)
+                admin_preview_text = build_raw_admin_text(
+                    title=title,
+                    summary=preview_text,
+                    source_url=link,
+                    feed_published_at=feed_published_at,
+                )
                 try:
                     admin_message = await app.bot.send_message(
                         chat_id=settings.telegram_admin_chat_id,
@@ -281,6 +357,7 @@ async def process_feeds(app: Application) -> int:
                         "link": link,
                         "title": title,
                         "summary": summary,
+                        "feed_published_at": feed_published_at,
                         "raw_preview_summary": preview_text,
                         "feed_text_extended": feed_text_extended,
                         "article_text": "",
