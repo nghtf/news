@@ -1,0 +1,11 @@
+services:
+  news-bot:
+    build: .
+    container_name: news-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NEWS_BOT_MODE=${NEWS_BOT_MODE:-prod}
+    volumes:
+      - ./state.json:/app/state.json

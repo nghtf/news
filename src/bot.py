@@ -1,0 +1,676 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import html
+import logging
+import re
+import uuid
+from typing import Any
+
+import feedparser
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, Forbidden
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from src.article_fetcher import fetch_article_text
+from src.config import Settings, load_settings
+from src.llm import LLMClient
+from src.storage import StateStore
+
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+TAG_RE = re.compile(r"<[^>]+>")
+ADMIN_BOT_ID_ERROR = "bots can't send messages to bots"
+MAX_TG_TEXT_LEN = 4096
+
+
+def resolve_publish_channel(settings: Settings) -> tuple[str, str]:
+    if settings.telegram_test_mode:
+        return settings.telegram_test_channel_id, "TELEGRAM_TEST_CHANNEL_ID"
+    return settings.telegram_channel_id, "TELEGRAM_CHANNEL_ID"
+
+
+def strip_html(text: str) -> str:
+    raw = TAG_RE.sub(" ", text or "")
+    raw = html.unescape(raw)
+    raw = re.sub(
+        r"\bMore\s*[→›»>]+\s*The post .*? appeared first on .*?\.?\s*$",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    raw = re.sub(
+        r"\bThe post .*? appeared first on .*?\.?\s*$",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def raw_review_keyboard(draft_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Принять в работу", callback_data=f"apr:{draft_id}")],
+            [InlineKeyboardButton("Отклонить", callback_data=f"rej:{draft_id}")],
+        ]
+    )
+
+
+def final_review_keyboard(draft_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Опубликовать", callback_data=f"pub:{draft_id}")],
+            [InlineKeyboardButton("Переписать", callback_data=f"rew:{draft_id}")],
+            [InlineKeyboardButton("Отклонить", callback_data=f"rej:{draft_id}")],
+        ]
+    )
+
+
+def build_raw_news_body(title: str, summary: str) -> str:
+    summary_short = summary.strip()
+    parts = []
+    title_clean = title.strip()
+    if title_clean:
+        parts.append(title_clean)
+    if summary_short:
+        parts.append(summary_short)
+    return "\n\n".join(parts).strip()
+
+
+def build_raw_admin_text(title: str, summary: str, source_url: str) -> str:
+    body = build_raw_news_body(title=title, summary=summary)
+    parts = [body] if body else []
+    parts.append(f"Источник: {source_url}")
+    text = "\n\n".join(parts)
+    if len(text) <= MAX_TG_TEXT_LEN:
+        return text
+    return text[: MAX_TG_TEXT_LEN - 3].rstrip() + "..."
+
+
+def build_final_admin_text(
+    title: str,
+    summary: str,
+    translated_text: str,
+    source_url: str,
+    llm_text_source: str = "",
+) -> str:
+    raw_body = build_raw_news_body(title=title, summary=summary)
+    translated = translated_text.strip()
+    parts = []
+    if raw_body:
+        parts.append(raw_body)
+    if translated:
+        parts.append(f"Предлагаемый перевод:\n\n{translated}")
+    if llm_text_source:
+        parts.append(f"Источник текста для перевода: {llm_text_source}")
+    parts.append(f"Источник: {source_url}")
+    text = "\n\n".join(parts)
+    if len(text) <= MAX_TG_TEXT_LEN:
+        return text
+    return text[: MAX_TG_TEXT_LEN - 3].rstrip() + "..."
+
+
+def resolve_text_for_llm(
+    pending: dict[str, Any],
+    draft_id: str,
+    store: StateStore,
+) -> tuple[str, str]:
+    cached_article_text = str(pending.get("article_text", "")).strip()
+    if cached_article_text:
+        logger.info("Using cached full article text for draft=%s", draft_id)
+        return cached_article_text, "полный текст статьи (cache)"
+
+    source_url = str(pending.get("link", "")).strip()
+    if source_url:
+        try:
+            article_text = fetch_article_text(source_url)
+            if article_text:
+                pending["article_text"] = article_text
+                store.save_pending(draft_id, pending)
+                logger.info(
+                    "Using fetched full article text for draft=%s chars=%d",
+                    draft_id,
+                    len(article_text),
+                )
+                return article_text, "полный текст статьи"
+            logger.info("Full article extraction returned empty for draft=%s", draft_id)
+        except Exception as exc:
+            logger.warning("Full article fetch failed for draft=%s (%s)", draft_id, exc)
+
+    feed_text_extended = str(pending.get("feed_text_extended", "")).strip()
+    summary_text = str(pending.get("summary", "")).strip()
+    if len(feed_text_extended) > len(summary_text) + 200:
+        logger.info("Using extended RSS content for draft=%s chars=%d", draft_id, len(feed_text_extended))
+        return feed_text_extended, "расширенный текст RSS"
+
+    logger.info("Using RSS summary text for draft=%s", draft_id)
+    return summary_text, "краткий текст RSS"
+
+
+async def ensure_admin(update: Update, settings: Settings) -> bool:
+    chat = update.effective_chat
+    user = update.effective_user
+    admin_chat_id = settings.telegram_admin_chat_id
+    is_allowed = bool(
+        (chat and chat.id == admin_chat_id)
+        or (user and user.id == admin_chat_id)
+    )
+    if not is_allowed:
+        logger.info(
+            "Admin check failed: expected admin_chat_id=%s, got chat_id=%s, user_id=%s",
+            admin_chat_id,
+            chat.id if chat else None,
+            user.id if user else None,
+        )
+    return is_allowed
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if not await ensure_admin(update, settings):
+        return
+    await update.message.reply_text(
+        "Бот запущен. Команды:\n/check - проверить RSS сейчас\n/stats - статистика"
+    )
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if not await ensure_admin(update, settings):
+        return
+
+    store: StateStore = context.application.bot_data["store"]
+    channel_blocked = bool(context.application.bot_data.get("channel_blocked"))
+    admin_blocked = bool(context.application.bot_data.get("admin_chat_blocked"))
+    publish_channel_id, publish_channel_var = resolve_publish_channel(settings)
+    publish_channel_name = "unknown"
+    try:
+        chat = await context.bot.get_chat(publish_channel_id)
+        if chat.title:
+            publish_channel_name = chat.title
+        elif chat.username:
+            publish_channel_name = f"@{chat.username}"
+        else:
+            publish_channel_name = str(chat.id)
+    except Exception as exc:
+        logger.warning("Failed to resolve publish channel title for stats: %s", exc)
+
+    await update.message.reply_text(
+        f"seen_links={store.seen_count()}\n"
+        f"pending={store.pending_count()}\n"
+        f"admin_chat_blocked={admin_blocked}\n"
+        f"channel_blocked={channel_blocked}\n"
+        f"publish_mode={'test' if settings.telegram_test_mode else 'prod'}\n"
+        f"publish_channel_var={publish_channel_var}\n"
+        f"publish_channel_id={publish_channel_id}\n"
+        f"publish_channel_name={publish_channel_name}"
+    )
+
+
+async def process_feeds(app: Application) -> int:
+    settings: Settings = app.bot_data["settings"]
+    store: StateStore = app.bot_data["store"]
+    lock: asyncio.Lock = app.bot_data["process_lock"]
+
+    created = 0
+    logger.info("Feed processing started. feeds=%d", len(settings.rss_feeds))
+    async with lock:
+        for feed_url in settings.rss_feeds:
+            logger.info("Fetching feed: %s", feed_url)
+            parsed = feedparser.parse(feed_url)
+            entries = list(getattr(parsed, "entries", []))
+            logger.info("Feed fetched: %s entries=%d", feed_url, len(entries))
+
+            for entry in reversed(entries):
+                link = getattr(entry, "link", "").strip()
+                title = getattr(entry, "title", "").strip()
+                summary = strip_html(getattr(entry, "summary", "") or getattr(entry, "description", ""))
+                feed_text_extended = ""
+                entry_content = getattr(entry, "content", None)
+                if isinstance(entry_content, list):
+                    parts: list[str] = []
+                    for chunk in entry_content:
+                        if isinstance(chunk, dict):
+                            value = chunk.get("value", "")
+                            if isinstance(value, str) and value.strip():
+                                parts.append(strip_html(value))
+                    feed_text_extended = " ".join([p for p in parts if p]).strip()
+                if not link or not title:
+                    continue
+                if store.is_seen(link) or store.has_pending_link(link):
+                    continue
+
+                draft_id = uuid.uuid4().hex[:10]
+                preview_text = summary
+                admin_preview_text = build_raw_admin_text(title=title, summary=preview_text, source_url=link)
+                try:
+                    admin_message = await app.bot.send_message(
+                        chat_id=settings.telegram_admin_chat_id,
+                        text=admin_preview_text,
+                        reply_markup=raw_review_keyboard(draft_id),
+                        disable_web_page_preview=True,
+                    )
+                except Forbidden as exc:
+                    if ADMIN_BOT_ID_ERROR in str(exc).lower():
+                        app.bot_data["admin_chat_blocked"] = True
+                        logger.error(
+                            "Invalid TELEGRAM_ADMIN_CHAT_ID=%s. "
+                            "Use user/group chat id, not bot id.",
+                            settings.telegram_admin_chat_id,
+                        )
+                        return created
+                    raise
+
+                store.save_pending(
+                    draft_id,
+                    {
+                        "link": link,
+                        "title": title,
+                        "summary": summary,
+                        "raw_preview_summary": preview_text,
+                        "feed_text_extended": feed_text_extended,
+                        "article_text": "",
+                        "stage": "raw_review",
+                        "raw_admin_text": admin_preview_text,
+                        "admin_message_id": admin_message.message_id,
+                        "rewrites": 0,
+                    },
+                )
+                created += 1
+                logger.info("Created pending draft=%s link=%s", draft_id, link)
+                if created >= settings.max_items_per_poll:
+                    logger.info("Feed processing limit reached: created=%d", created)
+                    return created
+    logger.info("Feed processing finished: created=%d", created)
+    return created
+
+
+async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if not await ensure_admin(update, settings):
+        return
+
+    if context.application.bot_data.get("admin_chat_blocked"):
+        await update.message.reply_text(
+            "Ошибка конфигурации: TELEGRAM_ADMIN_CHAT_ID указывает на бота. "
+            "Укажите id пользователя/группы и перезапустите."
+        )
+        return
+
+    created = await process_feeds(context.application)
+    await update.message.reply_text(f"Готово. Новых предложений: {created}")
+
+
+async def publish_to_channel(
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+    publish_text: str,
+) -> bool:
+    publish_channel_id, publish_channel_var = resolve_publish_channel(settings)
+    try:
+        await context.bot.send_message(
+            chat_id=publish_channel_id,
+            text=publish_text,
+            disable_web_page_preview=True,
+        )
+    except BadRequest as exc:
+        await context.bot.send_message(
+            chat_id=settings.telegram_admin_chat_id,
+            text=(
+                "Публикация не выполнена: чат канала не найден.\n"
+                f"Проверьте {publish_channel_var} (обычно -100... или @username) "
+                "и что бот добавлен в канал."
+            ),
+        )
+        logger.error("Channel publish failed (BadRequest): %s", exc)
+        return False
+    except Forbidden as exc:
+        await context.bot.send_message(
+            chat_id=settings.telegram_admin_chat_id,
+            text=(
+                "Публикация не выполнена: у бота нет прав в канале.\n"
+                "Добавьте бота в канал и выдайте право на публикацию сообщений."
+            ),
+        )
+        logger.error("Channel publish failed (Forbidden): %s", exc)
+        return False
+    return True
+
+
+async def on_admin_reply_publish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    store: StateStore = context.application.bot_data["store"]
+
+    if not await ensure_admin(update, settings):
+        return
+
+    message = update.effective_message
+    if not message or not message.text or not message.reply_to_message:
+        return
+
+    pending_pair = store.find_pending_by_admin_message_id(message.reply_to_message.message_id)
+    if not pending_pair:
+        return
+
+    draft_id, pending = pending_pair
+    stage = str(pending.get("stage", "final_review"))
+    if stage != "final_review":
+        await message.reply_text("Эта новость еще не на этапе публикации.")
+        return
+
+    publish_text = message.text.strip()
+    if not publish_text:
+        return
+
+    if not await publish_to_channel(context=context, settings=settings, publish_text=publish_text):
+        return
+
+    store.mark_seen(pending["link"])
+    store.delete_pending(draft_id)
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=settings.telegram_admin_chat_id,
+            message_id=int(pending["admin_message_id"]),
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    store: StateStore = context.application.bot_data["store"]
+    llm: LLMClient = context.application.bot_data["llm"]
+
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer("Обрабатываю...")
+    logger.info(
+        "Callback received: data=%s chat_id=%s user_id=%s message_id=%s",
+        query.data,
+        update.effective_chat.id if update.effective_chat else None,
+        update.effective_user.id if update.effective_user else None,
+        query.message.message_id if query.message else None,
+    )
+
+    if not await ensure_admin(update, settings):
+        await query.answer("Недостаточно прав для этого действия.", show_alert=True)
+        return
+
+    data = query.data or ""
+    action, draft_id = (data.split(":", 1) + [""])[:2]
+    logger.info("Callback parsed: action=%s draft_id=%s", action, draft_id)
+    pending = store.get_pending(draft_id)
+    if not pending:
+        logger.info("Callback ignored: pending not found for draft_id=%s", draft_id)
+        await query.answer("Эта карточка уже неактуальна.", show_alert=True)
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+
+    stage = str(pending.get("stage", "final_review"))
+    logger.info("Callback stage: action=%s draft_id=%s stage=%s", action, draft_id, stage)
+
+    if action == "apr":
+        if stage != "raw_review":
+            await query.answer("Эта новость уже обработана.", show_alert=False)
+            return
+
+        logger.info("APR started for draft_id=%s link=%s", draft_id, pending.get("link"))
+        try:
+            text_for_llm, text_source = resolve_text_for_llm(
+                pending=pending,
+                draft_id=draft_id,
+                store=store,
+            )
+            draft_text = llm.make_short_ru_news(
+                title=pending["title"],
+                text=text_for_llm,
+                source_url=pending["link"],
+            )
+        except Exception as exc:
+            logger.exception("LLM generation failed for %s", pending["link"])
+            reason = str(exc).strip()
+            if len(reason) > 500:
+                reason = reason[:500].rstrip() + "..."
+            await context.bot.send_message(
+                chat_id=settings.telegram_admin_chat_id,
+                text=(
+                    "Не удалось подготовить перевод для этой новости.\n"
+                    f"Причина: {reason}\n"
+                    "Попробуйте нажать «Принять в работу» еще раз."
+                ),
+            )
+            return
+
+        logger.info("APR generated draft for draft_id=%s", draft_id)
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        admin_message = await context.bot.send_message(
+            chat_id=settings.telegram_admin_chat_id,
+            text=build_final_admin_text(
+                title=pending["title"],
+                summary=str(pending.get("raw_preview_summary") or pending["summary"]),
+                translated_text=draft_text,
+                source_url=pending["link"],
+                llm_text_source=text_source,
+            ),
+            reply_markup=final_review_keyboard(draft_id),
+            disable_web_page_preview=True,
+        )
+        pending["draft_text"] = draft_text
+        pending["llm_text_source"] = text_source
+        pending["admin_message_id"] = admin_message.message_id
+        pending["stage"] = "final_review"
+        store.save_pending(draft_id, pending)
+        logger.info("APR completed for draft_id=%s moved to final_review", draft_id)
+        return
+
+    if action == "pub":
+        if stage != "final_review":
+            await query.answer("Сначала примите новость в работу.", show_alert=False)
+            return
+        publish_text = llm.to_channel_text(pending["draft_text"])
+        if not await publish_to_channel(context=context, settings=settings, publish_text=publish_text):
+            return
+        store.mark_seen(pending["link"])
+        store.delete_pending(draft_id)
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    if action == "rej":
+        store.mark_seen(pending["link"])
+        store.delete_pending(draft_id)
+        await query.message.delete()
+        return
+
+    if action == "rew":
+        if stage != "final_review":
+            await query.answer("Сначала примите новость в работу.", show_alert=False)
+            return
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        try:
+            text_for_llm, text_source = resolve_text_for_llm(
+                pending=pending,
+                draft_id=draft_id,
+                store=store,
+            )
+            new_text = llm.make_short_ru_news(
+                title=pending["title"],
+                text=text_for_llm,
+                source_url=pending["link"],
+                previous_draft=pending["draft_text"],
+            )
+        except Exception:
+            logger.exception("Rewrite failed for %s", pending["link"])
+            admin_message = await context.bot.send_message(
+                chat_id=settings.telegram_admin_chat_id,
+                text=build_final_admin_text(
+                    title=pending["title"],
+                    summary=str(pending.get("raw_preview_summary") or pending["summary"]),
+                    translated_text=pending["draft_text"],
+                    source_url=pending["link"],
+                    llm_text_source=str(pending.get("llm_text_source", "")),
+                ),
+                reply_markup=final_review_keyboard(draft_id),
+                disable_web_page_preview=True,
+            )
+            pending["admin_message_id"] = admin_message.message_id
+            store.save_pending(draft_id, pending)
+            return
+
+        admin_message = await context.bot.send_message(
+            chat_id=settings.telegram_admin_chat_id,
+            text=build_final_admin_text(
+                title=pending["title"],
+                summary=str(pending.get("raw_preview_summary") or pending["summary"]),
+                translated_text=new_text,
+                source_url=pending["link"],
+                llm_text_source=text_source,
+            ),
+            reply_markup=final_review_keyboard(draft_id),
+            disable_web_page_preview=True,
+        )
+        pending["draft_text"] = new_text
+        pending["llm_text_source"] = text_source
+        pending["admin_message_id"] = admin_message.message_id
+        pending["rewrites"] = int(pending.get("rewrites", 0)) + 1
+        store.save_pending(draft_id, pending)
+
+
+async def feed_worker(app: Application) -> None:
+    settings: Settings = app.bot_data["settings"]
+    while True:
+        if app.bot_data.get("admin_chat_blocked"):
+            logger.warning("Feed worker paused: admin chat is blocked")
+            await asyncio.sleep(max(1, settings.poll_interval_minutes) * 60)
+            continue
+        try:
+            await process_feeds(app)
+        except Exception:
+            logger.exception("Feed worker error")
+        await asyncio.sleep(max(1, settings.poll_interval_minutes) * 60)
+
+
+async def on_startup(app: Application) -> None:
+    settings: Settings = app.bot_data["settings"]
+    me = await app.bot.get_me()
+    if settings.telegram_admin_chat_id == me.id:
+        app.bot_data["admin_chat_blocked"] = True
+        logger.error(
+            "Invalid TELEGRAM_ADMIN_CHAT_ID=%s equals bot id=%s. "
+            "Set admin to your personal/group chat id.",
+            settings.telegram_admin_chat_id,
+            me.id,
+        )
+    else:
+        app.bot_data["admin_chat_blocked"] = False
+
+    app.bot_data["channel_blocked"] = False
+    publish_channel_id, publish_channel_var = resolve_publish_channel(settings)
+    try:
+        await app.bot.get_chat(publish_channel_id)
+    except BadRequest as exc:
+        app.bot_data["channel_blocked"] = True
+        logger.error(
+            "Invalid %s=%s (%s). Use channel id like -100... or @channel_username.",
+            publish_channel_var,
+            publish_channel_id,
+            exc,
+        )
+    except Forbidden as exc:
+        app.bot_data["channel_blocked"] = True
+        logger.error(
+            "Bot has no access to %s=%s (%s). Add bot to the channel as admin.",
+            publish_channel_var,
+            publish_channel_id,
+            exc,
+        )
+
+    app.bot_data["worker_task"] = asyncio.create_task(feed_worker(app))
+
+
+async def on_shutdown(app: Application) -> None:
+    task = app.bot_data.get("worker_task")
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+def build_app(settings: Settings) -> Application:
+    app = (
+        Application.builder()
+        .token(settings.telegram_bot_token)
+        .post_init(on_startup)
+        .post_shutdown(on_shutdown)
+        .build()
+    )
+
+    app.bot_data["settings"] = settings
+    app.bot_data["store"] = StateStore(settings.state_file)
+    app.bot_data["llm"] = LLMClient(
+        provider=settings.llm_provider,
+        api_key=settings.openai_api_key,
+        model=settings.llm_model,
+    )
+    app.bot_data["process_lock"] = asyncio.Lock()
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("check", check_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_admin_reply_publish))
+    app.add_error_handler(error_handler)
+    return app
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled telegram error", exc_info=context.error)
+
+
+def main() -> None:
+    settings = load_settings()
+    app = build_app(settings)
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    app.run_polling(
+        allowed_updates=[
+            "message",
+            "edited_message",
+            "channel_post",
+            "edited_channel_post",
+            "callback_query",
+            "my_chat_member",
+            "chat_member",
+        ],
+        drop_pending_updates=True,
+        close_loop=False,
+    )
+
+
+if __name__ == "__main__":
+    main()
