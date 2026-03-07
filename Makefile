@@ -6,11 +6,11 @@ install:
 ensure-state:
 	@if [ -d state.json ]; then \
 		echo "Error: state.json is a directory. Remove it and create a file."; \
-		echo "Run: rm -rf state.json && printf '{\"seen_links\":[],\"pending\":{}}\\n' > state.json"; \
+		echo "Run: rm -rf state.json && printf '{\"seen_links\":[],\"pending\":{}}\n' > state.json"; \
 		exit 1; \
 	fi
 	@if [ ! -f state.json ]; then \
-		printf '{\"seen_links\":[],\"pending\":{}}\\n' > state.json; \
+		printf '{"seen_links":[],"pending":{}}\n' > state.json; \
 	fi
 
 run: ensure-state
