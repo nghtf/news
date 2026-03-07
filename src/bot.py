@@ -246,7 +246,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_admin(update, settings):
         return
     await update.message.reply_text(
-        "Бот запущен. Команды:\n/check - проверить RSS сейчас\n/stats - статистика"
+        "Бот запущен. Команды:\n/check - проверить RSS сейчас\n/stats - статистика\n/clean - очистить pending"
     )
 
 
@@ -281,6 +281,15 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"publish_channel_id={publish_channel_id}\n"
         f"publish_channel_name={publish_channel_name}"
     )
+
+
+async def clean_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if not await ensure_admin(update, settings):
+        return
+    store: StateStore = context.application.bot_data["store"]
+    removed = store.clear_pending()
+    await update.message.reply_text(f"Pending очищен. Удалено карточек: {removed}")
 
 
 async def process_feeds(app: Application) -> int:
@@ -720,6 +729,7 @@ def build_app(settings: Settings) -> Application:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("check", check_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("clean", clean_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_admin_reply_publish))
     app.add_error_handler(error_handler)

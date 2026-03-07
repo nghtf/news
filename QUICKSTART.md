@@ -42,6 +42,7 @@ make docker-down
 - `/start`
 - `/check` — вручную проверить RSS
 - `/stats` — состояние (`seen_links`, `pending`)
+- `/clean` — очистить `pending` (карточки на модерации)
 
 Сброс состояния для теста "с нуля":
 ```bash

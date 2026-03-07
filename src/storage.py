@@ -86,3 +86,10 @@ class StateStore:
             if item.get("link") == link:
                 return True
         return False
+
+    def clear_pending(self) -> int:
+        data = self._read()
+        removed = len(data["pending"])
+        data["pending"] = {}
+        self._write(data)
+        return removed
