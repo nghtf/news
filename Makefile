@@ -1,12 +1,22 @@
-.PHONY: install run run-test check reset-state telegram-ids docker-build docker-up docker-up-test docker-down docker-logs docker-reset-state
+.PHONY: install ensure-state run run-test check reset-state telegram-ids docker-build docker-up docker-up-test docker-down docker-logs docker-reset-state
 
 install:
 	python3 -m pip install -r requirements.txt
 
-run:
+ensure-state:
+	@if [ -d state.json ]; then \
+		echo "Error: state.json is a directory. Remove it and create a file."; \
+		echo "Run: rm -rf state.json && printf '{\"seen_links\":[],\"pending\":{}}\\n' > state.json"; \
+		exit 1; \
+	fi
+	@if [ ! -f state.json ]; then \
+		printf '{\"seen_links\":[],\"pending\":{}}\\n' > state.json; \
+	fi
+
+run: ensure-state
 	NEWS_BOT_MODE=prod python3 -m src.bot
 
-run-test:
+run-test: ensure-state
 	NEWS_BOT_MODE=test python3 -m src.bot
 
 check:
@@ -21,10 +31,10 @@ telegram-ids:
 docker-build:
 	docker compose build
 
-docker-up:
+docker-up: ensure-state
 	NEWS_BOT_MODE=prod docker compose up -d
 
-docker-up-test:
+docker-up-test: ensure-state
 	NEWS_BOT_MODE=test docker compose up -d
 
 docker-down:

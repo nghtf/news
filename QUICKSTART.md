@@ -12,6 +12,7 @@ make install
 ```bash
 make run
 ```
+`state.json` будет создан автоматически (если отсутствует).
 
 Тестовый режим (публикация в `TELEGRAM_TEST_CHANNEL_ID`):
 ```bash
@@ -30,6 +31,7 @@ Docker в тестовом режиме:
 make docker-up-test
 make docker-logs
 ```
+Перед запуском также проверяется, что `state.json` — это файл, а не директория.
 
 Остановить:
 ```bash

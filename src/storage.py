@@ -10,8 +10,27 @@ class StateStore:
     def __init__(self, path: str) -> None:
         self._path = Path(path)
         self._lock = Lock()
+        if self._path.exists() and self._path.is_dir():
+            raise ValueError(
+                f"STATE_FILE points to a directory, expected a file: {self._path}. "
+                "If you use Docker bind mount, create state.json as a file on host."
+            )
         if not self._path.exists():
             self._write({"seen_links": [], "pending": {}})
+            return
+        self._validate_state_file()
+
+    def _validate_state_file(self) -> None:
+        with self._lock:
+            try:
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in state file: {self._path}") from exc
+        if not isinstance(data, dict) or "seen_links" not in data or "pending" not in data:
+            raise ValueError(
+                f"Invalid state file format: {self._path}. "
+                "Expected JSON object with keys: seen_links, pending."
+            )
 
     def _read(self) -> dict[str, Any]:
         with self._lock:
