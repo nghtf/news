@@ -441,7 +441,7 @@ async def process_feeds(app: Application) -> int:
             entries = list(getattr(parsed, "entries", []))
             logger.info("Feed fetched: %s entries=%d", feed_url, len(entries))
 
-            for entry in reversed(entries):
+            for entry in entries:
                 link = getattr(entry, "link", "").strip()
                 title = getattr(entry, "title", "").strip()
                 summary = extract_preview_text_from_feed(entry)
