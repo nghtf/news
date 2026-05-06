@@ -13,6 +13,15 @@ USER_AGENT = (
 )
 
 
+def _normalize_extracted_text(text: str) -> str:
+    paragraphs: list[str] = []
+    for line in text.splitlines():
+        paragraph = re.sub(r"\s+", " ", line).strip()
+        if paragraph:
+            paragraphs.append(paragraph)
+    return "\n\n".join(paragraphs)
+
+
 def fetch_article_text(url: str, timeout_seconds: int = 20, max_chars: int = 12000) -> str:
     req = request.Request(
         url=url,
@@ -38,7 +47,7 @@ def fetch_article_text(url: str, timeout_seconds: int = 20, max_chars: int = 120
     if not extracted:
         return ""
 
-    cleaned = re.sub(r"\s+", " ", extracted).strip()
+    cleaned = _normalize_extracted_text(extracted)
     if not cleaned:
         return ""
     if len(cleaned) > max_chars:

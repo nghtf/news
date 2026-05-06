@@ -38,6 +38,8 @@ ADMIN_BOT_ID_ERROR = "bots can't send messages to bots"
 MAX_TG_TEXT_LEN = 4096
 MAX_RAW_PREVIEW_SUMMARY_LEN = 260
 REQUIRED_FEED_CATEGORY = "Industry news"
+RAW_REVIEW_STAGE = "raw_review"
+FINAL_REVIEW_STAGE = "final_review"
 
 
 def resolve_publish_channel(settings: Settings) -> tuple[str, str]:
@@ -104,6 +106,20 @@ def build_feed_preview_summary(summary: str, max_len: int = MAX_RAW_PREVIEW_SUMM
     return cropped.rstrip(" .,:;!?") + "..."
 
 
+def extract_first_paragraph(text: str) -> str:
+    for paragraph in text.splitlines():
+        value = paragraph.strip()
+        if value:
+            return value
+    return ""
+
+
+def trim_telegram_text(text: str, max_len: int = MAX_TG_TEXT_LEN) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
 def extract_preview_text_from_feed(entry: Any) -> str:
     description = str(getattr(entry, "description", "") or entry.get("description", "")).strip()
     if description:
@@ -111,6 +127,21 @@ def extract_preview_text_from_feed(entry: Any) -> str:
         return strip_html(description)
     logger.info("Preview source fallback: RSS summary")
     return strip_html(str(getattr(entry, "summary", "") or entry.get("summary", "")).strip())
+
+
+def extract_extended_text_from_feed(entry: Any) -> str:
+    entry_content = getattr(entry, "content", None)
+    if not isinstance(entry_content, list):
+        return ""
+
+    parts: list[str] = []
+    for chunk in entry_content:
+        if not isinstance(chunk, dict):
+            continue
+        value = chunk.get("value", "")
+        if isinstance(value, str) and value.strip():
+            parts.append(strip_html(value))
+    return " ".join([part for part in parts if part]).strip()
 
 
 def entry_categories(entry: Any) -> list[str]:
@@ -141,10 +172,7 @@ def build_raw_admin_text(title: str, summary: str, source_url: str, feed_publish
     if feed_published_at.strip():
         parts.append(f"Дата новости: {feed_published_at.strip()}")
     parts.append(f"Источник: {source_url}")
-    text = "\n\n".join(parts)
-    if len(text) <= MAX_TG_TEXT_LEN:
-        return text
-    return text[: MAX_TG_TEXT_LEN - 3].rstrip() + "..."
+    return trim_telegram_text("\n\n".join(parts))
 
 
 def format_feed_published_at(entry: Any) -> str:
@@ -180,10 +208,103 @@ def build_final_admin_text(
     if llm_text_source:
         parts.append(f"Источник текста для перевода: {llm_text_source}")
     parts.append(f"Источник: {source_url}")
-    text = "\n\n".join(parts)
-    if len(text) <= MAX_TG_TEXT_LEN:
-        return text
-    return text[: MAX_TG_TEXT_LEN - 3].rstrip() + "..."
+    return trim_telegram_text("\n\n".join(parts))
+
+
+def build_pending_payload(
+    *,
+    link: str,
+    title: str,
+    summary: str,
+    feed_published_at: str,
+    raw_preview_summary: str,
+    feed_text_extended: str,
+    raw_admin_text: str,
+    admin_message_id: int,
+    article_text: str = "",
+) -> dict[str, Any]:
+    return {
+        "link": link,
+        "title": title,
+        "summary": summary,
+        "feed_published_at": feed_published_at,
+        "raw_preview_summary": raw_preview_summary,
+        "feed_text_extended": feed_text_extended,
+        "article_text": article_text,
+        "stage": RAW_REVIEW_STAGE,
+        "raw_admin_text": raw_admin_text,
+        "admin_message_id": admin_message_id,
+        "rewrites": 0,
+    }
+
+
+def resolve_raw_review_preview(link: str, summary: str) -> tuple[str, str]:
+    try:
+        article_text = fetch_article_text(link)
+    except Exception as exc:
+        logger.warning("Article fetch failed for raw review preview: %s (%s)", link, exc)
+    else:
+        first_paragraph = extract_first_paragraph(article_text)
+        if first_paragraph:
+            logger.info("Raw review preview source: first article paragraph")
+            return first_paragraph, article_text
+        logger.info("Raw review preview fallback: article extraction returned no paragraphs")
+
+    logger.info("Raw review preview fallback: RSS preview")
+    return build_feed_preview_summary(summary), ""
+
+
+def final_review_summary(pending: dict[str, Any]) -> str:
+    return str(pending.get("raw_preview_summary") or pending["summary"])
+
+
+def parse_callback_data(data: str) -> tuple[str, str]:
+    action, draft_id = (data.split(":", 1) + [""])[:2]
+    return action, draft_id
+
+
+async def delete_message_safely(message: Any) -> None:
+    if not message:
+        return
+    with contextlib.suppress(Exception):
+        await message.delete()
+
+
+async def clear_message_keyboard_safely(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    message_id: int,
+) -> None:
+    with contextlib.suppress(Exception):
+        await context.bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=None,
+        )
+
+
+async def send_final_review_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+    draft_id: str,
+    pending: dict[str, Any],
+    translated_text: str,
+    llm_text_source: str,
+) -> int:
+    admin_message = await context.bot.send_message(
+        chat_id=settings.telegram_admin_chat_id,
+        text=build_final_admin_text(
+            title=pending["title"],
+            summary=final_review_summary(pending),
+            translated_text=translated_text,
+            source_url=pending["link"],
+            llm_text_source=llm_text_source,
+        ),
+        reply_markup=final_review_keyboard(draft_id),
+        disable_web_page_preview=True,
+    )
+    return admin_message.message_id
 
 
 def resolve_text_for_llm(
@@ -191,10 +312,17 @@ def resolve_text_for_llm(
     draft_id: str,
     store: StateStore,
 ) -> tuple[str, str]:
+    raw_preview_text = str(pending.get("raw_preview_summary", "")).strip()
+    if raw_preview_text:
+        logger.info("Using raw review preview text for draft=%s", draft_id)
+        return raw_preview_text, "первый абзац статьи"
+
     cached_article_text = str(pending.get("article_text", "")).strip()
     if cached_article_text:
-        logger.info("Using cached full article text for draft=%s", draft_id)
-        return cached_article_text, "полный текст статьи (cache)"
+        first_paragraph = extract_first_paragraph(cached_article_text)
+        if first_paragraph:
+            logger.info("Using first paragraph from cached article text for draft=%s", draft_id)
+            return first_paragraph, "первый абзац статьи (cache)"
 
     source_url = str(pending.get("link", "")).strip()
     if source_url:
@@ -203,12 +331,19 @@ def resolve_text_for_llm(
             if article_text:
                 pending["article_text"] = article_text
                 store.save_pending(draft_id, pending)
+                first_paragraph = extract_first_paragraph(article_text)
+                if first_paragraph:
+                    logger.info(
+                        "Using first paragraph from fetched article text for draft=%s chars=%d",
+                        draft_id,
+                        len(first_paragraph),
+                    )
+                    return first_paragraph, "первый абзац статьи"
                 logger.info(
-                    "Using fetched full article text for draft=%s chars=%d",
+                    "Fetched article has no paragraphs for draft=%s chars=%d",
                     draft_id,
                     len(article_text),
                 )
-                return article_text, "полный текст статьи"
             logger.info("Full article extraction returned empty for draft=%s", draft_id)
         except Exception as exc:
             logger.warning("Full article fetch failed for draft=%s (%s)", draft_id, exc)
@@ -310,16 +445,7 @@ async def process_feeds(app: Application) -> int:
                 link = getattr(entry, "link", "").strip()
                 title = getattr(entry, "title", "").strip()
                 summary = extract_preview_text_from_feed(entry)
-                feed_text_extended = ""
-                entry_content = getattr(entry, "content", None)
-                if isinstance(entry_content, list):
-                    parts: list[str] = []
-                    for chunk in entry_content:
-                        if isinstance(chunk, dict):
-                            value = chunk.get("value", "")
-                            if isinstance(value, str) and value.strip():
-                                parts.append(strip_html(value))
-                    feed_text_extended = " ".join([p for p in parts if p]).strip()
+                feed_text_extended = extract_extended_text_from_feed(entry)
                 if not link or not title:
                     continue
                 if not has_required_category(entry):
@@ -334,7 +460,7 @@ async def process_feeds(app: Application) -> int:
                     continue
 
                 draft_id = uuid.uuid4().hex[:10]
-                preview_text = build_feed_preview_summary(summary)
+                preview_text, article_text = resolve_raw_review_preview(link=link, summary=summary)
                 feed_published_at = format_feed_published_at(entry)
                 admin_preview_text = build_raw_admin_text(
                     title=title,
@@ -362,19 +488,17 @@ async def process_feeds(app: Application) -> int:
 
                 store.save_pending(
                     draft_id,
-                    {
-                        "link": link,
-                        "title": title,
-                        "summary": summary,
-                        "feed_published_at": feed_published_at,
-                        "raw_preview_summary": preview_text,
-                        "feed_text_extended": feed_text_extended,
-                        "article_text": "",
-                        "stage": "raw_review",
-                        "raw_admin_text": admin_preview_text,
-                        "admin_message_id": admin_message.message_id,
-                        "rewrites": 0,
-                    },
+                    build_pending_payload(
+                        link=link,
+                        title=title,
+                        summary=summary,
+                        feed_published_at=feed_published_at,
+                        raw_preview_summary=preview_text,
+                        feed_text_extended=feed_text_extended,
+                        raw_admin_text=admin_preview_text,
+                        admin_message_id=admin_message.message_id,
+                        article_text=article_text,
+                    ),
                 )
                 created += 1
                 logger.info("Created pending draft=%s link=%s", draft_id, link)
@@ -453,8 +577,8 @@ async def on_admin_reply_publish(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     draft_id, pending = pending_pair
-    stage = str(pending.get("stage", "final_review"))
-    if stage != "final_review":
+    stage = str(pending.get("stage", FINAL_REVIEW_STAGE))
+    if stage != FINAL_REVIEW_STAGE:
         await message.reply_text("Эта новость еще не на этапе публикации.")
         return
 
@@ -467,14 +591,11 @@ async def on_admin_reply_publish(update: Update, context: ContextTypes.DEFAULT_T
 
     store.mark_seen(pending["link"])
     store.delete_pending(draft_id)
-    try:
-        await context.bot.edit_message_reply_markup(
-            chat_id=settings.telegram_admin_chat_id,
-            message_id=int(pending["admin_message_id"]),
-            reply_markup=None,
-        )
-    except Exception:
-        pass
+    await clear_message_keyboard_safely(
+        context,
+        chat_id=settings.telegram_admin_chat_id,
+        message_id=int(pending["admin_message_id"]),
+    )
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -499,23 +620,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     data = query.data or ""
-    action, draft_id = (data.split(":", 1) + [""])[:2]
+    action, draft_id = parse_callback_data(data)
     logger.info("Callback parsed: action=%s draft_id=%s", action, draft_id)
     pending = store.get_pending(draft_id)
     if not pending:
         logger.info("Callback ignored: pending not found for draft_id=%s", draft_id)
         await query.answer("Эта карточка уже неактуальна.", show_alert=True)
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
+        await delete_message_safely(query.message)
         return
 
-    stage = str(pending.get("stage", "final_review"))
+    stage = str(pending.get("stage", FINAL_REVIEW_STAGE))
     logger.info("Callback stage: action=%s draft_id=%s stage=%s", action, draft_id, stage)
 
     if action == "apr":
-        if stage != "raw_review":
+        if stage != RAW_REVIEW_STAGE:
             await query.answer("Эта новость уже обработана.", show_alert=False)
             return
 
@@ -547,33 +665,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         logger.info("APR generated draft for draft_id=%s", draft_id)
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
+        await delete_message_safely(query.message)
 
-        admin_message = await context.bot.send_message(
-            chat_id=settings.telegram_admin_chat_id,
-            text=build_final_admin_text(
-                title=pending["title"],
-                summary=str(pending.get("raw_preview_summary") or pending["summary"]),
-                translated_text=draft_text,
-                source_url=pending["link"],
-                llm_text_source=text_source,
-            ),
-            reply_markup=final_review_keyboard(draft_id),
-            disable_web_page_preview=True,
+        admin_message_id = await send_final_review_message(
+            context=context,
+            settings=settings,
+            draft_id=draft_id,
+            pending=pending,
+            translated_text=draft_text,
+            llm_text_source=text_source,
         )
         pending["draft_text"] = draft_text
         pending["llm_text_source"] = text_source
-        pending["admin_message_id"] = admin_message.message_id
-        pending["stage"] = "final_review"
+        pending["admin_message_id"] = admin_message_id
+        pending["stage"] = FINAL_REVIEW_STAGE
         store.save_pending(draft_id, pending)
         logger.info("APR completed for draft_id=%s moved to final_review", draft_id)
         return
 
     if action == "pub":
-        if stage != "final_review":
+        if stage != FINAL_REVIEW_STAGE:
             await query.answer("Сначала примите новость в работу.", show_alert=False)
             return
         publish_text = llm.to_channel_text(pending["draft_text"])
@@ -587,17 +698,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if action == "rej":
         store.mark_seen(pending["link"])
         store.delete_pending(draft_id)
-        await query.message.delete()
+        await delete_message_safely(query.message)
         return
 
     if action == "rew":
-        if stage != "final_review":
+        if stage != FINAL_REVIEW_STAGE:
             await query.answer("Сначала примите новость в работу.", show_alert=False)
             return
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
+        await delete_message_safely(query.message)
 
         try:
             text_for_llm, text_source = resolve_text_for_llm(
@@ -613,37 +721,29 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         except Exception:
             logger.exception("Rewrite failed for %s", pending["link"])
-            admin_message = await context.bot.send_message(
-                chat_id=settings.telegram_admin_chat_id,
-                text=build_final_admin_text(
-                    title=pending["title"],
-                    summary=str(pending.get("raw_preview_summary") or pending["summary"]),
-                    translated_text=pending["draft_text"],
-                    source_url=pending["link"],
-                    llm_text_source=str(pending.get("llm_text_source", "")),
-                ),
-                reply_markup=final_review_keyboard(draft_id),
-                disable_web_page_preview=True,
+            admin_message_id = await send_final_review_message(
+                context=context,
+                settings=settings,
+                draft_id=draft_id,
+                pending=pending,
+                translated_text=pending["draft_text"],
+                llm_text_source=str(pending.get("llm_text_source", "")),
             )
-            pending["admin_message_id"] = admin_message.message_id
+            pending["admin_message_id"] = admin_message_id
             store.save_pending(draft_id, pending)
             return
 
-        admin_message = await context.bot.send_message(
-            chat_id=settings.telegram_admin_chat_id,
-            text=build_final_admin_text(
-                title=pending["title"],
-                summary=str(pending.get("raw_preview_summary") or pending["summary"]),
-                translated_text=new_text,
-                source_url=pending["link"],
-                llm_text_source=text_source,
-            ),
-            reply_markup=final_review_keyboard(draft_id),
-            disable_web_page_preview=True,
+        admin_message_id = await send_final_review_message(
+            context=context,
+            settings=settings,
+            draft_id=draft_id,
+            pending=pending,
+            translated_text=new_text,
+            llm_text_source=text_source,
         )
         pending["draft_text"] = new_text
         pending["llm_text_source"] = text_source
-        pending["admin_message_id"] = admin_message.message_id
+        pending["admin_message_id"] = admin_message_id
         pending["rewrites"] = int(pending.get("rewrites", 0)) + 1
         store.save_pending(draft_id, pending)
 
