@@ -31,7 +31,12 @@ check:
 	python3 -m py_compile src/*.py
 
 reset-state:
-	python3 -m src.reset_state
+	@if [ -d state.json ]; then \
+		echo "Error: state.json is a directory. Remove it and create a file."; \
+		exit 1; \
+	fi
+	@printf '{"seen_links":[],"pending":{}}\n' > state.json
+	@echo "State reset: state.json"
 
 telegram-ids:
 	python3 -m src.telegram_ids
