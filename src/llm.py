@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from urllib import error, request
+
+
+PROMPTS_DIR = Path(__file__).with_name("prompts")
+SYSTEM_PROMPT = (PROMPTS_DIR / "system.txt").read_text(encoding="utf-8").strip()
+USER_PROMPT_TEMPLATE = (PROMPTS_DIR / "user.txt").read_text(encoding="utf-8").strip()
 
 
 class LLMClient:
@@ -16,28 +22,16 @@ class LLMClient:
         rewrite_hint = ""
         if previous_draft:
             rewrite_hint = (
-                "\nСделай новый вариант полного перевода этого же абзаца. "
+                "Сделай новый вариант полного перевода этого же абзаца. "
                 "Не сокращай и не пересказывай текст. Избегай формулировок из предыдущего варианта:\n"
                 f"{previous_draft}\n"
             )
 
-        prompt = (
-            "Задача: перевести текст на русский язык полностью, без сокращения и пересказа. "
-            "Сохрани названия продуктов, организаций, стандартов на английском языке. "
-            "Не ограничивай длину перевода искусственно: если исходный абзац длинный, переведи его целиком. "
-            "Пиши деловым и нейтральным тоном. "
-            "Используй профессиональную терминологию ИБ: не делай буквальный перевод терминов, если сомневаешься, то оставь слово на английском языке. "
-            "Используй устоявшиеся термины, например: darknet -> даркнет, threat actor -> киберпреступник/злоумышленник, "
-            "ransomware -> шифровальщик (ransomware), phishing -> фишинг, malware -> вредоносное ПО, "
-            "exploit -> эксплойт, zero-day -> 0-day, vulnerability -> уязвимость, threat intelligence -> третинтел или TI. "
-            "Не усиливай утверждения из исходника, не обобщай и не додумывай выгоды/эффекты. "
-            "Если в исходном тексте есть маркетинговое заявление компании, передай его нейтрально как факт заявления (например: 'по заявлению компании', 'утверждается, что' итп). "
-            "Без эмодзи, без markdown. "
-            "Не добавляй ссылку на источник, не упоминай источник и не добавляй служебные подписи."
-            f"{rewrite_hint}\n\n"
-            f"Заголовок: {title}\n"
-            f"Текст: {text}\n"
-            f"URL: {source_url}\n"
+        prompt = USER_PROMPT_TEMPLATE.format(
+            rewrite_hint=rewrite_hint,
+            title=title,
+            text=text,
+            source_url=source_url,
         )
 
         body = json.dumps(
@@ -47,11 +41,7 @@ class LLMClient:
                 "messages": [
                     {
                         "role": "system",
-                        "content": (
-                            "Ты профессиональный переводчик-редактор новостей по информационной безопасности. "
-                            "Твоя задача — делать полный перевод переданного абзаца на русский язык "
-                            "без сокращений, пересказа и добавления фактов."
-                        ),
+                        "content": SYSTEM_PROMPT,
                     },
                     {
                         "role": "user",
