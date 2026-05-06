@@ -21,7 +21,7 @@ from telegram.ext import (
     filters,
 )
 
-from src.article_fetcher import fetch_article_text
+from src.article_fetcher import USER_AGENT, fetch_article_text
 from src.config import Settings, load_settings
 from src.llm import LLMClient
 from src.storage import StateStore
@@ -433,11 +433,22 @@ async def process_feeds(app: Application) -> int:
     lock: asyncio.Lock = app.bot_data["process_lock"]
 
     created = 0
+    feed_errors: list[str] = []
     logger.info("Feed processing started. feeds=%d", len(settings.rss_feeds))
     async with lock:
         for feed_url in settings.rss_feeds:
             logger.info("Fetching feed: %s", feed_url)
-            parsed = feedparser.parse(feed_url)
+            parsed = feedparser.parse(feed_url, agent=USER_AGENT)
+            status = getattr(parsed, "status", None)
+            if isinstance(status, int) and status >= 400:
+                error_text = f"{feed_url}: HTTP {status}"
+                feed_errors.append(error_text)
+                logger.warning("Feed fetch failed: %s", error_text)
+                continue
+            if getattr(parsed, "bozo", False):
+                error_text = f"{feed_url}: {getattr(parsed, 'bozo_exception', 'parse error')}"
+                feed_errors.append(error_text)
+                logger.warning("Feed parse warning: %s", error_text)
             entries = list(getattr(parsed, "entries", []))
             logger.info("Feed fetched: %s entries=%d", feed_url, len(entries))
 
@@ -504,8 +515,10 @@ async def process_feeds(app: Application) -> int:
                 logger.info("Created pending draft=%s link=%s", draft_id, link)
                 if created >= settings.max_items_per_poll:
                     logger.info("Feed processing limit reached: created=%d", created)
+                    app.bot_data["last_feed_errors"] = feed_errors
                     return created
     logger.info("Feed processing finished: created=%d", created)
+    app.bot_data["last_feed_errors"] = feed_errors
     return created
 
 
@@ -522,6 +535,14 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     created = await process_feeds(context.application)
+    feed_errors = list(context.application.bot_data.get("last_feed_errors") or [])
+    if feed_errors:
+        errors_text = "\n".join(feed_errors[:3])
+        await update.message.reply_text(
+            f"Готово. Новых предложений: {created}\n\n"
+            f"Проблемы с RSS:\n{errors_text}"
+        )
+        return
     await update.message.reply_text(f"Готово. Новых предложений: {created}")
 
 
