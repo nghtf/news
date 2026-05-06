@@ -1,4 +1,11 @@
-.PHONY: install ensure-state clean run run-test check reset-state telegram-ids docker-build docker-up docker-up-test docker-down docker-logs docker-reset-state
+.PHONY: all install ensure-state clean run run-test check reset-state telegram-ids docker-build docker-up docker-up-test docker-down docker-logs docker-reset-state
+
+all:
+	git pull origin main
+	docker compose down
+	docker compose build
+	$(MAKE) reset-state
+	NEWS_BOT_MODE=prod docker compose up -d
 
 install:
 	python3 -m pip install -r requirements.txt
