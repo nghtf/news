@@ -91,7 +91,7 @@ def build_raw_news_body(title: str, summary: str) -> str:
     title_clean = title.strip()
     if title_clean:
         parts.append(title_clean)
-    if summary_short:
+    if summary_short and not is_same_text(summary_short, title_clean):
         parts.append(summary_short)
     return "\n\n".join(parts).strip()
 
@@ -106,10 +106,22 @@ def build_feed_preview_summary(summary: str, max_len: int = MAX_RAW_PREVIEW_SUMM
     return cropped.rstrip(" .,:;!?") + "..."
 
 
-def extract_first_paragraph(text: str) -> str:
+def normalize_for_text_match(text: str) -> str:
+    value = strip_html(text).casefold()
+    value = re.sub(r"[^\w\s]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def is_same_text(left: str, right: str) -> bool:
+    left_norm = normalize_for_text_match(left)
+    right_norm = normalize_for_text_match(right)
+    return bool(left_norm and right_norm and left_norm == right_norm)
+
+
+def extract_first_paragraph(text: str, title: str = "") -> str:
     for paragraph in text.splitlines():
         value = paragraph.strip()
-        if value:
+        if value and not is_same_text(value, title):
             return value
     return ""
 
@@ -238,13 +250,13 @@ def build_pending_payload(
     }
 
 
-def resolve_raw_review_preview(link: str, summary: str) -> tuple[str, str]:
+def resolve_raw_review_preview(link: str, title: str, summary: str) -> tuple[str, str]:
     try:
         article_text = fetch_article_text(link)
     except Exception as exc:
         logger.warning("Article fetch failed for raw review preview: %s (%s)", link, exc)
     else:
-        first_paragraph = extract_first_paragraph(article_text)
+        first_paragraph = extract_first_paragraph(article_text, title=title)
         if first_paragraph:
             logger.info("Raw review preview source: first article paragraph")
             return first_paragraph, article_text
@@ -319,7 +331,10 @@ def resolve_text_for_llm(
 
     cached_article_text = str(pending.get("article_text", "")).strip()
     if cached_article_text:
-        first_paragraph = extract_first_paragraph(cached_article_text)
+        first_paragraph = extract_first_paragraph(
+            cached_article_text,
+            title=str(pending.get("title", "")),
+        )
         if first_paragraph:
             logger.info("Using first paragraph from cached article text for draft=%s", draft_id)
             return first_paragraph, "первый абзац статьи (cache)"
@@ -331,7 +346,10 @@ def resolve_text_for_llm(
             if article_text:
                 pending["article_text"] = article_text
                 store.save_pending(draft_id, pending)
-                first_paragraph = extract_first_paragraph(article_text)
+                first_paragraph = extract_first_paragraph(
+                    article_text,
+                    title=str(pending.get("title", "")),
+                )
                 if first_paragraph:
                     logger.info(
                         "Using first paragraph from fetched article text for draft=%s chars=%d",
@@ -471,7 +489,11 @@ async def process_feeds(app: Application) -> int:
                     continue
 
                 draft_id = uuid.uuid4().hex[:10]
-                preview_text, article_text = resolve_raw_review_preview(link=link, summary=summary)
+                preview_text, article_text = resolve_raw_review_preview(
+                    link=link,
+                    title=title,
+                    summary=summary,
+                )
                 feed_published_at = format_feed_published_at(entry)
                 admin_preview_text = build_raw_admin_text(
                     title=title,
