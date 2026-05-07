@@ -4,6 +4,7 @@ all:
 	git pull origin main
 	docker compose down
 	docker compose build
+	@echo "WARNING: make all will reset bot state in state.json (seen_links and pending)."
 	$(MAKE) reset-state
 	NEWS_BOT_MODE=prod docker compose up -d
 
